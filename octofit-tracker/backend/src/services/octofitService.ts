@@ -1,6 +1,17 @@
 import mongoose from 'mongoose';
 import { Activity, Team, User, Workout } from '../models/index.js';
 
+async function createWithValidationAsBadRequest<T>(create: () => Promise<T>): Promise<T> {
+  try {
+    return await create();
+  } catch (error) {
+    if (error instanceof mongoose.Error.ValidationError) {
+      throw Object.assign(error, { status: 400 });
+    }
+    throw error;
+  }
+}
+
 export async function listActivities() {
   return Activity.find().lean();
 }
@@ -16,43 +27,41 @@ export async function createActivity(input: unknown) {
     throw Object.assign(new Error('userId, teamId, type, and minutes are required'), { status: 400 });
   }
 
-  if (!mongoose.Types.ObjectId.isValid(userId as string)) {
+  if (typeof userId !== 'string' || !/^[a-f\d]{24}$/i.test(userId)) {
     throw Object.assign(new Error('userId must be a valid ID'), { status: 400 });
   }
 
-  if (!mongoose.Types.ObjectId.isValid(teamId as string)) {
+  if (typeof teamId !== 'string' || !/^[a-f\d]{24}$/i.test(teamId)) {
     throw Object.assign(new Error('teamId must be a valid ID'), { status: 400 });
   }
 
-  const user = await User.findById(userId);
+  const userObjectId = new mongoose.Types.ObjectId(userId);
+  const teamObjectId = new mongoose.Types.ObjectId(teamId);
+  const user = await User.findById(userObjectId);
   if (!user) {
     throw Object.assign(new Error('User not found'), { status: 400 });
   }
 
-  const team = await Team.findById(teamId);
+  const team = await Team.findById(teamObjectId);
   if (!team) {
     throw Object.assign(new Error('Team not found'), { status: 400 });
   }
 
   const points = Math.max(1, Math.round((minutes as number) * 1.0));
-  const activity = await Activity.create({
+  const activity = await createWithValidationAsBadRequest(() => Activity.create({
     user: userId,
     team: teamId,
     type,
     minutes,
     points,
     occurredAt: new Date(),
-  });
+  }));
 
   return activity.toObject();
 }
 
 export async function listTeams() {
-  const teams = await Team.find().populate('members').lean();
-  return teams.map((team) => ({
-    ...team,
-    members: (team.members as any[]).map((m) => m._id ?? m),
-  }));
+  return Team.find().lean();
 }
 
 export async function createTeam(input: unknown) {
@@ -66,32 +75,30 @@ export async function createTeam(input: unknown) {
     throw Object.assign(new Error('Team name is required'), { status: 400 });
   }
 
-  const team = await Team.create({
+  const team = await createWithValidationAsBadRequest(() => Team.create({
     name,
     mascot: mascot ?? '',
     members: members ?? [],
-  });
+  }));
 
   return team.toObject();
 }
 
 export async function getLeaderboard() {
   const teams = await Team.find().lean();
-  
-  const leaderboard = await Promise.all(
-    teams.map(async (team) => {
-      const totalPoints = await Activity.aggregate([
-        { $match: { team: team._id } },
-        { $group: { _id: null, sum: { $sum: '$points' } } },
-      ]);
-      
-      return {
-        teamName: team.name,
-        totalPoints: totalPoints[0]?.sum ?? 0,
-        team: team._id,
-      };
-    })
-  );
+  const teamPoints = await Activity.aggregate([
+    { $group: { _id: '$team', totalPoints: { $sum: '$points' } } },
+  ]);
+  const pointsByTeam = new Map<string, number>();
+  for (const { _id, totalPoints } of teamPoints) {
+    pointsByTeam.set(String(_id), totalPoints);
+  }
+
+  const leaderboard = teams.map((team) => ({
+    teamName: team.name,
+    totalPoints: pointsByTeam.get(team._id.toString()) ?? 0,
+    team: team._id,
+  }));
 
   return leaderboard
     .sort((a, b) => b.totalPoints - a.totalPoints)
@@ -132,9 +139,7 @@ export async function suggestWorkouts(userEmail: string) {
   
   return workouts.map((workout) => ({
     ...workout,
-    reason: recentActivities.length > 0
-      ? `Matches your recent ${recentActivities[0].type} activity`
-      : `Matches your ${focus} fitness goal`,
+    reason: `Matches your ${focus} focus`,
   }));
 }
 
