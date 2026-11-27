@@ -1,27 +1,146 @@
+import mongoose from 'mongoose';
 import { Activity, Team, User, Workout } from '../models/index.js';
+
+async function createWithValidationAsBadRequest<T>(create: () => Promise<T>): Promise<T> {
+  try {
+    return await create();
+  } catch (error) {
+    if (error instanceof mongoose.Error.ValidationError) {
+      throw Object.assign(error, { status: 400 });
+    }
+    throw error;
+  }
+}
 
 export async function listActivities() {
   return Activity.find().lean();
 }
 
-export async function createActivity(_input: unknown) {
-  throw Object.assign(new Error('Activity validation is not implemented yet'), { status: 501 });
+export async function createActivity(input: unknown) {
+  if (!input || typeof input !== 'object') {
+    throw Object.assign(new Error('Activity data is required'), { status: 400 });
+  }
+
+  const { userId, teamId, type, minutes } = input as Record<string, unknown>;
+
+  if (!userId || !teamId || !type || minutes === undefined) {
+    throw Object.assign(new Error('userId, teamId, type, and minutes are required'), { status: 400 });
+  }
+
+  if (typeof userId !== 'string' || !/^[a-f\d]{24}$/i.test(userId)) {
+    throw Object.assign(new Error('userId must be a valid ID'), { status: 400 });
+  }
+
+  if (typeof teamId !== 'string' || !/^[a-f\d]{24}$/i.test(teamId)) {
+    throw Object.assign(new Error('teamId must be a valid ID'), { status: 400 });
+  }
+
+  const userObjectId = new mongoose.Types.ObjectId(userId);
+  const teamObjectId = new mongoose.Types.ObjectId(teamId);
+  const user = await User.findById(userObjectId);
+  if (!user) {
+    throw Object.assign(new Error('User not found'), { status: 400 });
+  }
+
+  const team = await Team.findById(teamObjectId);
+  if (!team) {
+    throw Object.assign(new Error('Team not found'), { status: 400 });
+  }
+
+  const points = Math.max(1, Math.round((minutes as number) * 1.0));
+  const activity = await createWithValidationAsBadRequest(() => Activity.create({
+    user: userId,
+    team: teamId,
+    type,
+    minutes,
+    points,
+    occurredAt: new Date(),
+  }));
+
+  return activity.toObject();
 }
 
 export async function listTeams() {
   return Team.find().lean();
 }
 
-export async function createTeam(_input: unknown) {
-  throw Object.assign(new Error('Team validation is not implemented yet'), { status: 501 });
+export async function createTeam(input: unknown) {
+  if (!input || typeof input !== 'object') {
+    throw Object.assign(new Error('Team data is required'), { status: 400 });
+  }
+
+  const { name, mascot, members } = input as Record<string, unknown>;
+
+  if (!name) {
+    throw Object.assign(new Error('Team name is required'), { status: 400 });
+  }
+
+  const team = await createWithValidationAsBadRequest(() => Team.create({
+    name,
+    mascot: mascot ?? '',
+    members: members ?? [],
+  }));
+
+  return team.toObject();
 }
 
 export async function getLeaderboard() {
-  return [];
+  const teams = await Team.find().lean();
+  const teamPoints = await Activity.aggregate([
+    { $group: { _id: '$team', totalPoints: { $sum: '$points' } } },
+  ]);
+  const pointsByTeam = new Map<string, number>();
+  for (const { _id, totalPoints } of teamPoints) {
+    pointsByTeam.set(String(_id), totalPoints);
+  }
+
+  const leaderboard = teams.map((team) => ({
+    teamName: team.name,
+    totalPoints: pointsByTeam.get(team._id.toString()) ?? 0,
+    team: team._id,
+  }));
+
+  return leaderboard
+    .sort((a, b) => b.totalPoints - a.totalPoints)
+    .map((entry, index) => ({
+      teamName: entry.teamName,
+      totalPoints: entry.totalPoints,
+      rank: index + 1,
+    }));
 }
 
-export async function suggestWorkouts(_userEmail: string) {
-  return Workout.find().limit(1).lean();
+export async function suggestWorkouts(userEmail: string) {
+  const user = await User.findOne({ email: userEmail }).lean();
+  
+  if (!user) {
+    throw Object.assign(new Error('User not found'), { status: 404 });
+  }
+
+  const recentActivities = await Activity.find({ user: user._id }).sort({ occurredAt: -1 }).limit(5).lean();
+  
+  let focus = user.fitnessGoal;
+  if (recentActivities.length > 0) {
+    const activityCounts: Record<string, number> = {};
+    for (const activity of recentActivities) {
+      activityCounts[activity.type] = (activityCounts[activity.type] ?? 0) + 1;
+    }
+    
+    const dominantType = Object.entries(activityCounts).sort(([, a], [, b]) => b - a)[0]?.[0];
+    if (dominantType === 'run' || dominantType === 'walk') {
+      focus = 'endurance';
+    } else if (dominantType === 'strength') {
+      focus = 'strength';
+    } else if (dominantType === 'cycle') {
+      focus = 'endurance';
+    }
+  }
+
+  const workouts = await Workout.find({ focus }).lean();
+  
+  return workouts.map((workout) => ({
+    ...workout,
+    reason: `Matches your ${focus} focus`,
+  }));
 }
 
 export { User };
